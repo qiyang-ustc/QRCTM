@@ -14,7 +14,7 @@ import numpy as np
 jax.config.update("jax_enable_x64", True)
 print("Runing on Device:", jax.devices())
 
-
+# Do Traditional CTMRG in the first few steps to make alg stable.
 def init_env(M: Array, chi: int) -> tuple[Array, Array]:
     D = M.shape[1]
     T = jnp.einsum("ialqr, iampn -> lmqprn", M, M).reshape((D * D, D, D, D * D))
@@ -57,7 +57,7 @@ def update_C(T, C, v, Mu, Md):
     extended_C = contract(
         "ibfj,i,iaep,xabcd,xefgh,jcgq,pdhr->qr", T, C, T, Mu, Md, v, v
     )
-    C, q = jnp.linalg.eigh(extended_C)
+    C, q = jnp.linalg.eigh(extended_C) # Remove Gauge(Part 1/3: Get projector), not necessary.
     return C, q
 
 
@@ -73,10 +73,10 @@ def next_TC(env, Mu, Md):
     D, chi = Mu.shape[1], T.shape[0]
 
     v = qr_step(C, T, D, chi)
-    C, q = update_C(T, C, v, Mu, Md)
+    C, q = update_C(T, C, v, Mu, Md) # Remove Gauge(Part 2/3), not necessary.
 
     T = update_T(T, v, Mu, Md)
-    T = jnp.einsum("ijkl,ia,lb->ajkb", T, q, q)
+    T = jnp.einsum("ijkl,ia,lb->ajkb", T, q, q) # Remove Gauge(Part 3/3 use the projector to T), not necessary.
 
     return [normalize_without_gradient(C), normalize_without_gradient(T)]
 
@@ -84,8 +84,8 @@ def next_TC(env, Mu, Md):
 # noinspection DuplicatedCode
 @partial(jax.jit, static_argnums=(3, 4, 5, 6))
 def ctmrg(env, Mu, Md, miniter=20, maxiter=30, tol=1e-12, verbosity=0):
-    for i in range(maxiter):
-        env = [env[0], env[1] + env[1].transpose(3, 1, 2, 0)]
+    for i in range(maxiter): # A fix number of for loop is enough
+        env = [env[0], env[1] + env[1].transpose(3, 1, 2, 0)] # This is cheap, and make sure T is hermitian(.conj is need)/symmetric
         env = next_TC(env, Mu, Md)
     return env
 
@@ -95,17 +95,17 @@ def traspose_basis(basis, params):
     basisT = np.zeros((params.size, basis.size))
     for i in range(basis.size):
         basisT[basis[i], i] = 1
-    return jnp.array(basisT)
+    return jnp.array(basisT) # Get a effective basis for C4V tensors, see a more sophisticated version in Kitaev.py
 
-
+# Get density matrix
 @jax.jit
 def get_rho(env, M1u, M1d, M2u, M2d):
     C, T = env
     C = C + C.T
     T = T + T.transpose(3, 1, 2, 0)
-    L = contract("i,iklm,m->iklm", C, T, C)
-    L1 = contract("ibfj,iaep,xabcd,yefgh,jcgq->pdhqxy", L, T, M1u, M1d, T)
-    L2 = contract("ibfj,iaep,xabcd,yefgh,jcgq->pdhqxy", L, T, M2u, M2d, T)
+    L = contract("i,iklm,m->iklm", C, T, C) # CTC
+    L1 = contract("ibfj,iaep,xabcd,yefgh,jcgq->pdhqxy", L, T, M1u, M1d, T) # The Left part is CTC-TMT-
+    L2 = contract("ibfj,iaep,xabcd,yefgh,jcgq->pdhqxy", L, T, M2u, M2d, T) # The Left part is exactly the same, one could just use L if you know L1=L2.
     return jnp.einsum("ijklab,ijklcd->abcd", L1, L2)
 
 
@@ -124,7 +124,7 @@ sigma_z_rot = rot @ sigma_z @ rot.T
 Ez = jnp.einsum("ij,kl->ijkl", sigma_z, sigma_z_rot) / 4
 Ep = jnp.einsum("ij,kl->ijkl", sigma_p, sigma_m_rot) / 2
 Em = jnp.einsum("ij,kl->ijkl", sigma_m, sigma_p_rot) / 2
-Eterm = Ez + Ep + Em
+Eterm = Ez + Ep + Em # four-leg local Hamilonian
 
 
 @partial(jax.jit, static_argnums=(3, 4))
@@ -136,9 +136,9 @@ def Heisenberg_energy(params, env, basis, d, D):
 
     M = params[basis].reshape(d, D, D, D, D)
     rho = get_rho(env, M, M, M, M)
-    I = jnp.einsum("aacc->", rho)
+    I = jnp.einsum("aacc->", rho) # equivalent to insert identity
     E = jnp.einsum("abcd,abcd->", rho, Eterm)
-    return 2.0 * E / I
+    return 2.0 * E / I # vertical and horizontal
 
 
 # noinspection DuplicatedCode
@@ -150,7 +150,7 @@ def loss(params, env, basis, d, D, maxiter=12, warmupiter=2):
         params[basis].reshape(d, D, D, D, D).conj(),
     )
 
-    env = jax.lax.stop_gradient(ctmrg(env, Mu, Md, maxiter=warmupiter))
+    env = jax.lax.stop_gradient(ctmrg(env, Mu, Md, maxiter=warmupiter)) # Remove from AD tree
     env = ctmrg(env, Mu, Md, maxiter=maxiter)
     return Heisenberg_energy(params, env, basis, d, D)
 
@@ -193,6 +193,7 @@ def plot_fig(
     return None
 
 
+# Maybe ask GPT to demonstrate it, I tested, GPT-5 works well
 # noinspection DuplicatedCode
 def generate_basis(a, symmetrize):
     a_size = np.size(a)
