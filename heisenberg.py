@@ -72,11 +72,10 @@ class CTMRG:
                 C, T = normalize(C+C.T.conj()), normalize(T+T.permute(3, 1, 2, 0).conj())
 
         for _ in range(ADiter):
+            v, r = self._qr(C, T)
             if self.checkpoint and ADiter > 0 and M.requires_grad:
-                v, r = torch.utils.checkpoint.checkpoint(self._qr, C, T, use_reentrant=True)
                 T = torch.utils.checkpoint.checkpoint(self._update_T, T, v, M, use_reentrant=True)
             else:
-                v, r = self._qr(C, T)
                 T = self._update_T(T, v, M)
             C = torch.einsum("ijkl,la,ajkx->ix", T, r, v)
             C, T = normalize(C+C.T.conj()), normalize(T+T.permute(3, 1, 2, 0).conj())
