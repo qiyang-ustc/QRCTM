@@ -1,297 +1,186 @@
-# %% Import Modules
-import fire
-import jax
-import numpy as np
-import jax.numpy as jnp
+import argparse
 import time
-from scipy import optimize
-from functools import partial
-from jaxtyping import Num, Array
-from opt_einsum import contract
-import matplotlib.pyplot as plt
+from typing import List, Tuple
 import numpy as np
+import torch
+from torch import optim
 
-jax.config.update("jax_enable_x64", True)
-print("Runing on Device:", jax.devices())
+DTYPE = torch.complex128
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Do Traditional CTMRG in the first few steps to make alg stable.
-def init_env(M: Array, chi: int) -> tuple[Array, Array]:
-    D = M.shape[1]
-    T = jnp.einsum("ialqr, iampn -> lmqprn", M, M).reshape((D * D, D, D, D * D))
-    C = jnp.linalg.eigvalsh(jnp.einsum("lqqr->lr", T))
+DEFAULT_CONFIG = {
+    "chi": 24,
+    "d": 2,
+    "D": 4,
+    "seed": 7,
+    "ADiter": 16,
+    "warmup": 2,
+    "warmupiter": 40,
+    "maxoptiter": 120,
+    "checkpoint": False,
+}
 
-    nC = contract("i,ibfk,iael,xabcd,xefgh->kcgldh", C, T, T, M, M)
-    nC = nC.reshape(nC.shape[0] * D * D, nC.shape[0] * D * D)
-    w, v = jnp.linalg.eigh(nC)
-    v = v[:, jnp.argsort(jnp.abs(w))[-chi:]].reshape(-1, D, D, chi)
-    C = contract("ibfj,i,iaep,xabcd,xefgh,jcgq,pdhr->qr", T, C, T, M, M, v, v)
-    C, q = jnp.linalg.eigh(C)
-    T = contract("ibfj,iaep,xabcd,xefgh,jcgq->pdhq", T, v, M, M, v)
-    T = jnp.einsum("ijkl,ia,lb->ajkb", T, q, q)
-    return [C, T]
+def normalize(x: torch.Tensor) -> torch.Tensor:
+    return x / torch.linalg.norm(x)
 
+class C4Symmetrizer:
+    def __call__(self, A: torch.Tensor) -> torch.Tensor:
+        A = A + A.permute(0, 1, 4, 3, 2)
+        A = A + A.permute(0, 3, 2, 1, 4)
+        A = A + A.permute(0, 4, 1, 2, 3)
+        A = A + A.permute(0, 3, 4, 1, 2)
+        return normalize(A)
 
-# noinspection DuplicatedCode
-def symmetrize_C4(T: Num[Array, "dims"]) -> Num[Array, "ndims"]:
-    T = T + T.transpose(0, 1, 4, 3, 2)  # U-D reflection
-    T = T + T.transpose(0, 3, 2, 1, 4)  # L-R reflection
-    T = T + T.transpose(0, 4, 1, 2, 3)  # 90 deg CCW rotation
-    T = T + T.transpose(0, 3, 4, 1, 2)  # 180deg CCW rotation
-    return T
-
-
-@partial(jax.jit, static_argnums=(2, 3))  # D and chi are static
-def qr_step(C, T, D, chi):
-    reshaped = jnp.reshape(jnp.einsum("i,iklm->iklm", C, T), (D * D * chi, chi))
-    q, r = jax.lax.linalg.qr(reshaped, full_matrices=False)
-    return jnp.reshape(q, (chi, D, D, chi))
-
-
-@jax.jit
-def update_T(T, v, Mu, Md):
-    return contract("ibfj,iaep,xabcd,xefgh,jcgq->pdhq", T, v, Mu, Md, v)
-
-
-@jax.jit
-def update_C(T, C, v, Mu, Md):
-    extended_C = contract(
-        "ibfj,i,iaep,xabcd,xefgh,jcgq,pdhr->qr", T, C, T, Mu, Md, v, v
-    )
-    C, q = jnp.linalg.eigh(extended_C) # Remove Gauge(Part 1/3: Get projector), not necessary.
-    return C, q
-
-
-@jax.jit
-def normalize_without_gradient(T):
-    return T / jax.lax.stop_gradient(jnp.linalg.norm(T))
+class EnvironmentInitializer:
+    def __call__(self, M: torch.Tensor, chi: int) -> List[torch.Tensor]:
+        with torch.no_grad():
+            M = normalize(M)
+            d, D = M.shape[:2]
+            T = torch.einsum("ialqr,iampn->lmqprn", M, M.conj()).reshape(D * D, D, D, D * D)
+            C = torch.linalg.eigvalsh(torch.einsum("lqqr->lr", T)).abs()
+            nC = torch.einsum("i,ibfk,iael,xabcd,xefgh->kcgldh", C, T, T, M, M.conj())
+            mat = nC.reshape(nC.shape[0] * D * D, nC.shape[0] * D * D)
+            w, v = torch.linalg.eigh(mat)
+            v = v[:, torch.argsort(w.abs())[-min(chi, v.shape[1]):]].reshape(-1, D, D, min(chi, v.shape[1]))
+            C0 = torch.einsum("ibfj,i,iaep,xabcd,xefgh,jcgq,pdhr->qr", T, C, T, M, M.conj(), v, v)
+            C0, q = torch.linalg.eigh(C0)
+            T0 = torch.einsum("ibfj,iaep,xabcd,xefgh,jcgq->pdhq", T, v, M, M.conj(), v)
+            T0 = torch.einsum("ijkl,ia,lb->ajkb", T0, q, q)
+            # Pad up to chi if necessary (cheap and stable like Kitaev)
+            C0 = torch.diag(C0)
+            if C0.shape[0] < chi:
+                pad_c = chi - C0.shape[0]
+                C0 = torch.nn.functional.pad(C0, (0, pad_c, 0, pad_c))
+                T0 = torch.nn.functional.pad(T0, (0, 0, 0, pad_c, 0, pad_c))
+        dev = M.device
+        return [normalize(C0.to(device=dev, dtype=DTYPE)), normalize(T0.to(device=dev, dtype=DTYPE))]
 
 
-# noinspection DuplicatedCode
-@jax.jit
-def next_TC(env, Mu, Md):
-    C, T = env
-    D, chi = Mu.shape[1], T.shape[0]
+class CTMRG:
+    def __init__(self, checkpoint=True):
+        self.checkpoint = checkpoint
 
-    v = qr_step(C, T, D, chi)
-    C, q = update_C(T, C, v, Mu, Md) # Remove Gauge(Part 2/3), not necessary.
+    @staticmethod
+    def _qr(C: torch.Tensor, T: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        chi, D = C.shape[0], T.shape[1]
+        CT = torch.einsum("ij,jklm->iklm", C, T).reshape(chi * D * D, chi)
+        q, r = torch.linalg.qr(CT, mode="reduced")
+        return q.reshape(chi, D, D, chi), r
 
-    T = update_T(T, v, Mu, Md)
-    T = jnp.einsum("ijkl,ia,lb->ajkb", T, q, q) # Remove Gauge(Part 3/3 use the projector to T), not necessary.
+    @staticmethod
+    def _update_T(T: torch.Tensor, v: torch.Tensor, M: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        return torch.einsum("ibfj,iaep,xabcd,xefgh,jcgq->pdhq", T, v, M, M.conj(), v)
 
-    return [normalize_without_gradient(C), normalize_without_gradient(T)]
+    def __call__(self, M: torch.Tensor, env: List[torch.Tensor], warmup=0, ADiter=0) -> List[torch.Tensor]:
+        C, T = env
+        with torch.no_grad():
+            for _ in range(warmup):
+                v, r = self._qr(C, T)
+                T = self._update_T(T, v, M)
+                C = torch.einsum("ijkl,la,ajkx->ix", T, r, v)
+                C, T = normalize(C+C.T.conj()), normalize(T+T.permute(3, 1, 2, 0).conj())
 
-
-# noinspection DuplicatedCode
-@partial(jax.jit, static_argnums=(3, 4, 5, 6))
-def ctmrg(env, Mu, Md, miniter=20, maxiter=30, tol=1e-12, verbosity=0):
-    for i in range(maxiter): # A fix number of for loop is enough
-        env = [env[0], env[1] + env[1].transpose(3, 1, 2, 0)] # This is cheap, and make sure T is hermitian(.conj is need)/symmetric
-        env = next_TC(env, Mu, Md)
-    return env
-
-
-# noinspection DuplicatedCode
-def traspose_basis(basis, params):
-    basisT = np.zeros((params.size, basis.size))
-    for i in range(basis.size):
-        basisT[basis[i], i] = 1
-    return jnp.array(basisT) # Get a effective basis for C4V tensors, see a more sophisticated version in Kitaev.py
-
-# Get density matrix
-@jax.jit
-def get_rho(env, M1u, M1d, M2u, M2d):
-    C, T = env
-    C = C + C.T
-    T = T + T.transpose(3, 1, 2, 0)
-    L = contract("i,iklm,m->iklm", C, T, C) # CTC
-    L1 = contract("ibfj,iaep,xabcd,yefgh,jcgq->pdhqxy", L, T, M1u, M1d, T) # The Left part is CTC-TMT-
-    L2 = contract("ibfj,iaep,xabcd,yefgh,jcgq->pdhqxy", L, T, M2u, M2d, T) # The Left part is exactly the same, one could just use L if you know L1=L2.
-    return jnp.einsum("ijklab,ijklcd->abcd", L1, L2)
+        for _ in range(ADiter):
+            if self.checkpoint and ADiter > 0 and M.requires_grad:
+                v, r = torch.utils.checkpoint.checkpoint(self._qr, C, T, use_reentrant=True)
+                T = torch.utils.checkpoint.checkpoint(self._update_T, T, v, M, use_reentrant=True)
+            else:
+                v, r = self._qr(C, T)
+                T = self._update_T(T, v, M)
+            C = torch.einsum("ijkl,la,ajkx->ix", T, r, v)
+            C, T = normalize(C+C.T.conj()), normalize(T+T.permute(3, 1, 2, 0).conj())
+        return [C, T]
 
 
-# noinspection DuplicatedCode
-sigma_x = jnp.array([[0, 1.0], [1.0, 0]])
-sigma_y = jnp.array([[0, -1.0j], [1.0j, 0]])
-sigma_z = jnp.array([[1.0, 0], [0, -1.0]])
-sigma_p = jnp.array([[0, 1.0], [0, 0]])
-sigma_m = jnp.array([[0, 0], [1.0, 0]])
-rot = jnp.array([[0, 1.0], [-1.0, 0]])
+class HeisenbergEnergy:
+    def __init__(self):
+        sp = torch.tensor([[0.0, 1.0], [0.0, 0.0]], dtype=DTYPE, device=DEVICE)
+        sm = torch.tensor([[0.0, 0.0], [1.0, 0.0]], dtype=DTYPE, device=DEVICE)
+        sz = torch.tensor([[1.0, 0.0], [0.0, -1.0]], dtype=DTYPE, device=DEVICE)
+        rot = torch.tensor([[0.0, 1.0], [-1.0, 0.0]], dtype=DTYPE, device=DEVICE)
+        sp_r, sm_r, sz_r = rot @ sp @ rot.T, rot @ sm @ rot.T, rot @ sz @ rot.T
+        Ez = torch.einsum("ij,kl->ijkl", sz, sz_r) / 4
+        Ep = torch.einsum("ij,kl->ijkl", sp, sm_r) / 2
+        Em = torch.einsum("ij,kl->ijkl", sm, sp_r) / 2
+        self.E = (Ez + Ep + Em).to(DEVICE)
 
-sigma_p_rot = rot @ sigma_p @ rot.T
-sigma_m_rot = rot @ sigma_m @ rot.T
-sigma_z_rot = rot @ sigma_z @ rot.T
+    def _rho(self, env: List[torch.Tensor], M: torch.Tensor) -> torch.Tensor:
+        C, T = env
+        Csym, Tsym = C + C.conj(), T + T.permute(3, 1, 2, 0).conj()
+        L = torch.einsum("ij,jklm,mn->ikln", Csym, Tsym, Csym)
+        L = torch.einsum("ibfj,iaep,xabcd,yefgh,jcgq->pdhqxy", L, Tsym, M, M.conj(), Tsym)
+        return torch.einsum("pdhqxy,pdhqzw->xyzw", L, L)
 
-Ez = jnp.einsum("ij,kl->ijkl", sigma_z, sigma_z_rot) / 4
-Ep = jnp.einsum("ij,kl->ijkl", sigma_p, sigma_m_rot) / 2
-Em = jnp.einsum("ij,kl->ijkl", sigma_m, sigma_p_rot) / 2
-Eterm = Ez + Ep + Em # four-leg local Hamilonian
+    def __call__(self, M: torch.Tensor, env: List[torch.Tensor]) -> torch.Tensor:
+        rho = self._rho(env, M)
+        norm = torch.einsum("aacc->", rho)
+        energy = torch.einsum("abcd,abcd->", rho, self.E)
+        return 2.0 * torch.real(energy / norm)
 
-
-@partial(jax.jit, static_argnums=(3, 4))
-def Heisenberg_energy(params, env, basis, d, D):
-    """
-    res=tprod({SIGMAZ,SIGMAZ})/4 + tprod({SIGMAP,SIGMAM})/2 + tprod({SIGMAM,SIGMAP})/2;
-    res=fscon({res,rot,conj(rot)},{[-1 2 -3 4],[2 -2],[4 -4]});
-    """
-
-    M = params[basis].reshape(d, D, D, D, D)
-    rho = get_rho(env, M, M, M, M)
-    I = jnp.einsum("aacc->", rho) # equivalent to insert identity
-    E = jnp.einsum("abcd,abcd->", rho, Eterm)
-    return 2.0 * E / I # vertical and horizontal
+def bulk_tensor(params: torch.Tensor, d: int, D: int) -> torch.Tensor:
+    return normalize(params.reshape(d, D, D, D, D).to(DTYPE))
 
 
-# noinspection DuplicatedCode
-@partial(jax.jit, static_argnums=(3, 4, 5, 6))
-def loss(params, env, basis, d, D, maxiter=12, warmupiter=2):
-    params = normalize_without_gradient(params)
-    Mu, Md = (
-        params[basis].reshape(d, D, D, D, D),
-        params[basis].reshape(d, D, D, D, D).conj(),
-    )
+def mwe_main(config=None):
+    cfg = DEFAULT_CONFIG.copy()
+    if config:
+        cfg.update(config)
 
-    env = jax.lax.stop_gradient(ctmrg(env, Mu, Md, maxiter=warmupiter)) # Remove from AD tree
-    env = ctmrg(env, Mu, Md, maxiter=maxiter)
-    return Heisenberg_energy(params, env, basis, d, D)
+    chi = cfg["chi"]
+    d = cfg["d"]
+    D = cfg["D"]
+    seed = cfg["seed"]
+    ADiter = cfg["ADiter"]
+    warmup = cfg["warmup"]
+    warmupiter = cfg["warmupiter"]
+    maxoptiter = cfg["maxoptiter"]
 
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    sym = C4Symmetrizer()
+    energy_fn = HeisenbergEnergy()
+    initializer = EnvironmentInitializer()
+    ctmrg = CTMRG()
 
-# noinspection DuplicatedCode
-def plot_fig(
-    data,
-    file="energy",
-    yscale="log",
-    figsize=(10, 6),
-    scatter_size=30,
-    scatter_color="#1f77b4",
-    xlabel="Iterations",
-    ylabel=None,
-    title=None,
-    title_fontsize=14,
-    label_fontsize=12,
-    submin=False,
-):
+    nparams = d * D * D * D * D
+    params = (torch.rand(nparams, device=DEVICE, dtype=torch.float64) - 0.5).requires_grad_(True)
 
-    data = np.array(data)
-    if submin:
-        shift = np.min(data)
-        title = title + f" Shift:{shift:.8f}"
-    else:
-        shift = 0.0
-    fig, ax = plt.subplots(figsize=figsize)
-    ax.scatter(
-        np.arange(len(data)),
-        data - shift,
-        s=scatter_size,
-        color=scatter_color,
-    )
-    ax.set_yscale(yscale)
-    ax.set_xlabel(xlabel, fontsize=label_fontsize)
-    ax.set_ylabel(ylabel, fontsize=label_fontsize)
-    ax.set_title(title, fontsize=title_fontsize)
-    fig.tight_layout()
-    plt.savefig(file + ".png", dpi=600)
-    return None
+    M0 = sym(bulk_tensor(params, d, D))
+    env = initializer(M0, chi)
+    env = ctmrg(M0, env, warmup=warmupiter, ADiter=0)
 
-
-# Maybe ask GPT to demonstrate it, I tested, GPT-5 works well
-# noinspection DuplicatedCode
-def generate_basis(a, symmetrize):
-    a_size = np.size(a)
-    q = -np.ones(a_size, dtype=np.int32)
-    t = np.zeros(a_size, dtype=np.int32)
-    tot = 0  # total number of basis
-    for i in range(a_size):
-        if q[i] == -1:  # if q[i]!=0 means this number is occupied, and linear dependent
-            t.fill(0)
-            t[i] = 1
-            t_sym = symmetrize(t.reshape(a.shape)).flatten()
-            q[~np.isclose(t_sym, 0)] = tot
-            tot += 1
-    return q, tot
-
-
-# noinspection DuplicatedCode
-def loss_and_grads(**kwargs):
-    local_loss = partial(loss, **kwargs)  # loss(params, env)
-
-    def cal_loss(params, env):
-        value = local_loss(jnp.array(params), env)
-        return np.array(value)
-
-    def cal_grads(params, env):
-        params = jnp.array(params)
-        grads = jax.grad(local_loss)(params, env)
-        return grads
-
-    return cal_loss, cal_grads
-
-
-# noinspection DuplicatedCode
-def main(
-    chi: int = 80,
-    d: int = 2,
-    D: int = 4,
-    seed: int = 52,
-    maxiter: int = 12,
-    init=None,
-    maxoptiter=10000,
-):
-
-    basis, Nparams = generate_basis(
-        jax.random.uniform(jax.random.PRNGKey(seed), (d, D, D, D, D)), symmetrize_C4
-    )
-    basis = jnp.array(basis)
-
-    # init params
-    if init is not None:
-        params = init
-    else:
-        params = jax.random.uniform(jax.random.PRNGKey(seed), Nparams) - 0.5
-
-    # A careful initialization
-    M = params[basis].reshape(d, D, D, D, D)
-    env = init_env(M, chi)
-    C, T = ctmrg(env, M, M, maxiter=100)
-    env[0] = C
-    env[1] = T
-
-    loss_history = []
-    time_history = []
+    optimizer = optim.LBFGS([params], max_iter=maxoptiter, tolerance_grad=1e-8, tolerance_change=1e-12, history_size=200, line_search_fn="strong_wolfe")
+    loss_history: List[float] = []
     start = time.time()
-    numpy_loss, numpy_grads = loss_and_grads(D=D, d=d, basis=basis, maxiter=maxiter)
 
-    def callback(params):
+    def closure():
         nonlocal env
-        loss_history.append(numpy_loss(params, env))
-        time_history.append(time.time() - start)
-        print(loss_history[-1])
-        Mu, Md = (
-            params[basis].reshape(d, D, D, D, D),
-            params[basis].reshape(d, D, D, D, D).conj(),
-        )
-        C, T = ctmrg(env, Mu, Md, maxiter=10)
-        env[0] = C
-        env[1] = T
-        # print(C) # spectrum
-        return None
+        optimizer.zero_grad(set_to_none=True)
+        M = sym(bulk_tensor(params, d, D))
+        env2 = ctmrg(M, env, warmup=0, ADiter=ADiter)
+        E = energy_fn(M, env2)
+        E.backward()
+        with torch.no_grad():
+            env = ctmrg(sym(bulk_tensor(params, d, D)), env, warmup=warmup, ADiter=0)
+            loss_history.append(E.item())
+            elapsed = time.time() - start
+            print(f"[{len(loss_history):03d}] E={E.item():.8f} | t={elapsed:.2f}s")
+        return E
 
-    res = optimize.fmin_l_bfgs_b(
-        func=lambda x: numpy_loss(x, env),
-        x0=params,
-        fprime=lambda x: numpy_grads(x, env),
-        callback=callback,
-        factr=1e0,
-        m=200,
-        pgtol=1e-10,
-        maxiter=maxoptiter,
-        maxls=10,
-    )
-
-    print(res)
-    plot_fig(loss_history, title="energy", file="energy", submin=True)
-    plot_fig(time_history, title="time", file="time", yscale="linear")
-    return res, env
+    optimizer.step(closure)
+    print(f"Final energy: {loss_history[-1]:.8f}")
+    return loss_history[-1]
 
 
 if __name__ == "__main__":
-    res, env = main(seed=93)
+    parser = argparse.ArgumentParser(description="2D Heisenberg C4 PEPS (PyTorch)")
+    parser.add_argument("--chi", type=int, default=DEFAULT_CONFIG["chi"])
+    parser.add_argument("--d", type=int, default=DEFAULT_CONFIG["d"])
+    parser.add_argument("--D", type=int, default=DEFAULT_CONFIG["D"])
+    parser.add_argument("--seed", type=int, default=DEFAULT_CONFIG["seed"])
+    parser.add_argument("--ADiter", type=int, default=DEFAULT_CONFIG["ADiter"])
+    parser.add_argument("--warmup", type=int, default=DEFAULT_CONFIG["warmup"])
+    parser.add_argument("--warmupiter", type=int, default=DEFAULT_CONFIG["warmupiter"])
+    parser.add_argument("--maxoptiter", type=int, default=DEFAULT_CONFIG["maxoptiter"])
+    args = vars(parser.parse_args())
+    mwe_main(args)

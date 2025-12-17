@@ -141,9 +141,20 @@ class QRCTMRG:
     def __call__(self, M: torch.Tensor, env: List[torch.Tensor], warmup=0, ADiter=0) -> List[torch.Tensor]:
         C, R = env
         for _ in range(warmup + ADiter):
-            CR, v = self._cheap_forward(C, R)
-            C = self._update_C(CR, R, v, M)
-            R = self._update_R(v, R, M)
+            # CR, v = self._cheap_forward(C, R)
+            # C = self._update_C(CR, R, v, M)
+            # R = self._update_R(v, R, M)
+
+            CR, v = torch.utils.checkpoint.checkpoint(
+                self._cheap_forward, 
+                C, R, use_reentrant=True)
+            C = torch.utils.checkpoint.checkpoint(
+                self._update_C, 
+                CR, R, v, M, use_reentrant=True)
+            R = torch.utils.checkpoint.checkpoint(
+                self._update_R, 
+                v, R, M, use_reentrant=True)
+
             # normalize
             C = C / torch.linalg.norm(C)
             R = R / torch.linalg.norm(R)
