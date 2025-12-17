@@ -33,28 +33,19 @@ class C4Symmetrizer:
 
 class EnvironmentInitializer:
     def __call__(self, M: torch.Tensor, chi: int) -> List[torch.Tensor]:
+        D = M.shape[1]
+        assert chi > D**2, "Strongly suggest chi > D**2"
         with torch.no_grad():
             M = normalize(M)
-            d, D = M.shape[:2]
-            T = torch.einsum("ialqr,iampn->lmqprn", M, M.conj()).reshape(D * D, D, D, D * D)
-            C = torch.linalg.eigvalsh(torch.einsum("lqqr->lr", T)).abs()
-            nC = torch.einsum("i,ibfk,iael,xabcd,xefgh->kcgldh", C, T, T, M, M.conj())
-            mat = nC.reshape(nC.shape[0] * D * D, nC.shape[0] * D * D)
-            w, v = torch.linalg.eigh(mat)
-            v = v[:, torch.argsort(w.abs())[-min(chi, v.shape[1]):]].reshape(-1, D, D, min(chi, v.shape[1]))
-            C0 = torch.einsum("ibfj,i,iaep,xabcd,xefgh,jcgq,pdhr->qr", T, C, T, M, M.conj(), v, v)
-            C0, q = torch.linalg.eigh(C0)
-            T0 = torch.einsum("ibfj,iaep,xabcd,xefgh,jcgq->pdhq", T, v, M, M.conj(), v)
-            T0 = torch.einsum("ijkl,ia,lb->ajkb", T0, q, q)
-            # Pad up to chi if necessary (cheap and stable like Kitaev)
-            C0 = torch.diag(C0)
-            if C0.shape[0] < chi:
-                pad_c = chi - C0.shape[0]
-                C0 = torch.nn.functional.pad(C0, (0, pad_c, 0, pad_c))
-                T0 = torch.nn.functional.pad(T0, (0, 0, 0, pad_c, 0, pad_c))
-        dev = M.device
-        return [normalize(C0.to(device=dev, dtype=DTYPE)), normalize(T0.to(device=dev, dtype=DTYPE))]
+            T = torch.einsum("xabcd,xaefg->becfgd", M, M.conj())
+            C = torch.einsum("beccgd->begd", T)
+            C, T = C.reshape(D**2, D**2), T.reshape(D**2, D, D, D**2)
 
+            pad_c = chi - C.shape[0]
+            C = torch.nn.functional.pad(C, (0, pad_c, 0, pad_c))
+            T = torch.nn.functional.pad(T, (0, pad_c, 0, 0, 0, 0, 0, pad_c))
+        dev = M.device
+        return [normalize(C.to(device=dev, dtype=DTYPE)), normalize(T.to(device=dev, dtype=DTYPE))]
 
 class CTMRG:
     def __init__(self, checkpoint=True):
