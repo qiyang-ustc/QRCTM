@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from torch import optim
 
-DTYPE = torch.complex128
+DTYPE = torch.float64
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DEFAULT_CONFIG = {
