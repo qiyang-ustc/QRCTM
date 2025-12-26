@@ -119,45 +119,26 @@ class QRCTMRG:
     def _cheap_forward(C: torch.Tensor, R: torch.Tensor):
         chi, D = R.shape[0], R.shape[1]
         CR = torch.einsum("iq,qjkm->ijkm", C, R)
-        v, _ = torch.linalg.qr(CR.reshape(D * D * chi, chi), mode='reduced')
+        v, r = torch.linalg.qr(CR.reshape(D * D * chi, chi), mode='reduced')
         v = v.reshape(chi, D, D, chi)
-        return CR, v
-
-    @staticmethod
-    def _update_C(CR: torch.Tensor, R: torch.Tensor, v: torch.Tensor, M: torch.Tensor):
-        # CRM: iABt,ijkl,xjAp,xkBq -> tpql
-        CRM = torch.einsum("iABt,ijkl,xjAp,xkBq->tpql", CR.conj(), R, M, M.conj())
-        # C': tJKr,tpql,yJap,yKbq,labc -> rc
-        Cnew = torch.einsum("tJKr,tpql,yJap,yKbq,labc->rc", v.conj(), CRM, M, M.conj(), v)
-        return Cnew
+        return v, r
 
     @staticmethod
     def _update_R(v: torch.Tensor, R: torch.Tensor, M: torch.Tensor):
         # R': iABt,ijkl,xjAp,xkBq,yJap,yKbq,labc -> tJKc
-        Rnew = torch.einsum("iABt,ijkl,xjAp,xkBq,yJap,yKbq,labc->tJKc",
+        Rnew = torch.einsum("iABt,ijkl,xjAp,xkBq,yJap,yKbq,labc->tJKc", # potential slicing along t
                             v.conj(), R, M, M.conj(), M, M.conj(), v)
         return Rnew
 
     def __call__(self, M: torch.Tensor, env: List[torch.Tensor], warmup=0, ADiter=0) -> List[torch.Tensor]:
         C, R = env
         for _ in range(warmup + ADiter):
-            # CR, v = self._cheap_forward(C, R)
-            # C = self._update_C(CR, R, v, M)
-            # R = self._update_R(v, R, M)
-
-            CR, v = torch.utils.checkpoint.checkpoint(
-                self._cheap_forward, 
-                C, R, use_reentrant=True)
-            C = torch.utils.checkpoint.checkpoint(
-                self._update_C, 
-                CR, R, v, M, use_reentrant=True)
-            R = torch.utils.checkpoint.checkpoint(
-                self._update_R, 
-                v, R, M, use_reentrant=True)
-
+            v, r = self._cheap_forward(C, R)
+            Rnew = self._update_R(v, R, M)
+            Cnew = torch.einsum("tJKc,tb,bJKr->cr", Rnew.conj(), r, v) 
             # normalize
-            C = C / torch.linalg.norm(C)
-            R = R / torch.linalg.norm(R)
+            C = Cnew / torch.linalg.norm(Cnew)
+            R = Rnew / torch.linalg.norm(Rnew)
         return [C, R]
 
 
@@ -187,7 +168,7 @@ class KitaevEnergy:
     @staticmethod
     def _L(RC: torch.Tensor, CRC: torch.Tensor, M: torch.Tensor, op: torch.Tensor) -> torch.Tensor:
         # ibca, ijkm, xjbp, xy, ykcq -> apqm
-        return torch.einsum("ibca,ijkm,xjbp,xy,ykcq->apqm",
+        return torch.einsum("ibca,ijkm,xjbp,xy,ykcq->apqm", # potential slicing along a
                             RC.conj(), CRC, M, op, M.conj())
 
     @staticmethod
