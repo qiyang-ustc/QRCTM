@@ -18,14 +18,14 @@ def normalize(x: torch.Tensor) -> torch.Tensor:
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "chi": 20,
+    "chi": 100,
     "d": 2,
     "D": 4,
     "seed": 7,
     "ADiter": 20,
     "warmup": 2,
     "warmupiter": 50,
-    "maxoptiter": 100,
+    "maxoptiter": 400,
 }
 
 
@@ -131,7 +131,7 @@ class QRCTMRG:
         return Rnew
 
     def __call__(self, M: torch.Tensor, env: List[torch.Tensor], warmup=0, ADiter=0) -> List[torch.Tensor]:
-        C, R = env
+        C, R = env[0].detach(), env[1].detach()
         for _ in range(warmup + ADiter):
             v, r = self._cheap_forward(C, R)
             Rnew = self._update_R(v, R, M)
@@ -237,22 +237,17 @@ def mwe_main(config: Optional[Dict[str, Any]] = None):
         nonlocal fun_evals, iteration_count, env, prev_params
         optimizer.zero_grad(set_to_none=True)
         M = normalize(symmetrizer(P))
-        env2 = ctmrg_module(M, env, warmup=0, ADiter=ADiter)
-        E = energy_module(M, env2)
+        env = ctmrg_module(M, env, warmup=warmup, ADiter=ADiter)
+        E = energy_module(M, env)
         E.backward()
         fun_evals += 1
         
-        # Update environment for next iteration (similar to main.py closure)
         with torch.no_grad():
-            M_now = normalize(symmetrizer(P))
-            env = ctmrg_module(M_now, env, warmup=warmup, ADiter=0)
-            E_now = energy_module(M_now, env).item()
-            
             # Only print and record on actual LBFGS iterations (not line search evaluations)
             current_iter = optimizer.state[P].get('n_iter', 0)
             if current_iter > iteration_count:
                 iteration_count = current_iter
-                loss_history.append(E_now)
+                loss_history.append(E.item())
                 elapsed = time.time() - wall0
                 time_history.append(elapsed)
                 grad_norm = torch.norm(P.grad) if P.grad is not None else torch.tensor(0.0, dtype=torch.float64)
@@ -260,7 +255,7 @@ def mwe_main(config: Optional[Dict[str, Any]] = None):
                 dparam = torch.norm(P.detach() - prev_params).item()
                 param_changes.append(dparam)
                 prev_params = P.detach().clone()
-                print(f"[Iter {iteration_count:4d}/{maxoptiter}] E={E_now:.8f} | grad={grad_norm.item():.3e} | dP={dparam:.3e} | t={elapsed:.2f}s | fevals={fun_evals}")
+                print(f"[Iter {iteration_count:4d}/{maxoptiter}] E={E.item():.8f} | grad={grad_norm.item():.3e} | dP={dparam:.3e} | t={elapsed:.2f}s | fevals={fun_evals}")
         
         return E
 
