@@ -9,7 +9,7 @@ DTYPE = torch.float64
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DEFAULT_CONFIG = {
-    "chi": 24,
+    "chi": 100,
     "d": 2,
     "D": 4,
     "seed": 7,
