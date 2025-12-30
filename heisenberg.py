@@ -12,11 +12,11 @@ DEFAULT_CONFIG = {
     "chi": 100,
     "d": 2,
     "D": 4,
-    "seed": 7,
+    "seed": 987654321,
     "ADiter": 16,
     "warmup": 2,
     "warmupiter": 40,
-    "maxoptiter": 120,
+    "maxoptiter": 300,
     "checkpoint": False,
 }
 
@@ -63,7 +63,7 @@ class CTMRG:
         return torch.einsum("ibfj,iaep,xabcd,xefgh,jcgq->pdhq", T, v, M, M.conj(), v)
 
     def __call__(self, M: torch.Tensor, env: List[torch.Tensor], warmup=0, ADiter=0) -> List[torch.Tensor]:
-        C, T = env
+        C, T = env[0].detach(), env[1].detach()
         with torch.no_grad():
             for _ in range(warmup):
                 v, r = self._qr(C, T)
@@ -147,11 +147,10 @@ def mwe_main(config=None):
         nonlocal env
         optimizer.zero_grad(set_to_none=True)
         M = sym(bulk_tensor(params, d, D))
-        env2 = ctmrg(M, env, warmup=warmup, ADiter=ADiter)
-        E = energy_fn(M, env2)
+        env = ctmrg(M, env, warmup=warmup, ADiter=ADiter)
+        E = energy_fn(M, env)
         E.backward()
         with torch.no_grad():
-            env = ctmrg(sym(bulk_tensor(params, d, D)), env, warmup=warmup, ADiter=0)
             loss_history.append(E.item())
             elapsed = time.time() - start
             print(f"[{len(loss_history):03d}] E={E.item():.8f} | t={elapsed:.2f}s")
