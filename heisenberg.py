@@ -147,7 +147,7 @@ def mwe_main(config=None):
         nonlocal env
         optimizer.zero_grad(set_to_none=True)
         M = sym(bulk_tensor(params, d, D))
-        env2 = ctmrg(M, env, warmup=0, ADiter=ADiter)
+        env2 = ctmrg(M, env, warmup=warmup, ADiter=ADiter)
         E = energy_fn(M, env2)
         E.backward()
         with torch.no_grad():
