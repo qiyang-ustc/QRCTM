@@ -5,8 +5,8 @@ This repository provides a minimal working example of the **QR-CTMRG** (Corner T
 > **[Accelerating two-dimensional tensor network contractions using QR-decompositions](https://arxiv.org/abs/2505.00494)**
 > *Yining Zhang, Qi Yang, Philippe Corboz, 2025, (Co-first author)*
 
-> **[Efficient iPEPS Simulation on the Honeycomb Lattice via QR-based CTMRG, Phys. Rev. B 113, 085109](https://journals.aps.org/prb/abstract/10.1103/9gmp-byx8)**
-> *Qi Yang, Philippe Corboz, 2025*
+> **[Efficient iPEPS Simulation on the Honeycomb Lattice via QR-based CTMRG](https://journals.aps.org/prb/abstract/10.1103/9gmp-byx8)**
+> *Qi Yang, Philippe Corboz, Phys. Rev. B 113, 085109(2026)*
 
 This code demonstrates a simple and clean implementation of the QR-CTMRG algorithm for 2D tensor network contraction, suitable for variational optimization of PEPS (Projected Entangled Pair States) and related models.
 
